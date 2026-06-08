@@ -57,42 +57,42 @@ class PushLedgerDatabase(context: Context) :
 }
 
 class TransactionRepository(context: Context) {
-    private val database = PushLedgerDatabase(context.applicationContext)
+    // SQLiteOpenHelper는 싱글턴처럼 유지해야 함. use { }로 매번 닫으면 안 됨.
+    private val db = PushLedgerDatabase(context.applicationContext)
 
     @Synchronized
     fun insertIfNew(parsed: ParsedTransaction, location: LocationSnapshot?): InsertResult {
         val now = System.currentTimeMillis()
-        database.writableDatabase.use { db ->
-            val existing = findIdByFingerprint(db, parsed.fingerprint)
-            if (existing != null) {
-                insertLog(db, parsed.sourcePackage, parsed.capturedAt, ParseStatus.DUPLICATE, "same fingerprint", existing)
-                return InsertResult.Duplicate(existing)
-            }
-
-            val values = ContentValues().apply {
-                put("occurred_at", parsed.occurredAt)
-                put("captured_at", parsed.capturedAt)
-                put("amount", parsed.amount)
-                put("direction", parsed.direction.name)
-                put("merchant_name", parsed.merchantName)
-                put("source_package", parsed.sourcePackage)
-                put("source_app_name", parsed.sourceAppName)
-                put("notification_key", parsed.notificationKey)
-                put("fingerprint", parsed.fingerprint)
-                put("category", parsed.category)
-                put("category_confidence", parsed.categoryConfidence)
-                put("category_source", parsed.categorySource.name)
-                put("latitude", location?.latitude)
-                put("longitude", location?.longitude)
-                put("location_accuracy_m", location?.accuracyM)
-                put("raw_text_preview", parsed.rawTextPreview)
-                put("created_at", now)
-                put("updated_at", now)
-            }
-            val id = db.insertOrThrow("transactions", null, values)
-            insertLog(db, parsed.sourcePackage, parsed.capturedAt, ParseStatus.CREATED, null, id)
-            return InsertResult.Created(id)
+        val wdb = db.writableDatabase   // 닫지 않음 — Helper가 수명을 관리
+        val existing = findIdByFingerprint(wdb, parsed.fingerprint)
+        if (existing != null) {
+            insertLog(wdb, parsed.sourcePackage, parsed.capturedAt, ParseStatus.DUPLICATE, "same fingerprint", existing)
+            return InsertResult.Duplicate(existing)
         }
+
+        val values = ContentValues().apply {
+            put("occurred_at", parsed.occurredAt)
+            put("captured_at", parsed.capturedAt)
+            put("amount", parsed.amount)
+            put("direction", parsed.direction.name)
+            put("merchant_name", parsed.merchantName)
+            put("source_package", parsed.sourcePackage)
+            put("source_app_name", parsed.sourceAppName)
+            put("notification_key", parsed.notificationKey)
+            put("fingerprint", parsed.fingerprint)
+            put("category", parsed.category)
+            put("category_confidence", parsed.categoryConfidence)
+            put("category_source", parsed.categorySource.name)
+            put("latitude", location?.latitude)
+            put("longitude", location?.longitude)
+            put("location_accuracy_m", location?.accuracyM)
+            put("raw_text_preview", parsed.rawTextPreview)
+            put("created_at", now)
+            put("updated_at", now)
+        }
+        val id = wdb.insertOrThrow("transactions", null, values)
+        insertLog(wdb, parsed.sourcePackage, parsed.capturedAt, ParseStatus.CREATED, null, id)
+        return InsertResult.Created(id)
     }
 
     @Synchronized
@@ -103,39 +103,24 @@ class TransactionRepository(context: Context) {
             put("category_source", source.name)
             put("updated_at", System.currentTimeMillis())
         }
-        database.writableDatabase.use { db ->
-            db.update("transactions", values, "id = ?", arrayOf(id.toString()))
-        }
+        db.writableDatabase.update("transactions", values, "id = ?", arrayOf(id.toString()))
     }
 
     @Synchronized
     fun recent(limit: Int = 50): List<LedgerTransaction> =
-        database.readableDatabase.use { db ->
-            db.query(
-                "transactions",
-                null,
-                null,
-                null,
-                null,
-                null,
-                "captured_at DESC",
-                limit.toString()
-            ).use { cursor -> cursor.readTransactions() }
-        }
+        db.readableDatabase.query(
+            "transactions", null, null, null, null, null,
+            "captured_at DESC", limit.toString()
+        ).use { cursor -> cursor.readTransactions() }
 
     @Synchronized
     fun between(startMillis: Long, endMillis: Long): List<LedgerTransaction> =
-        database.readableDatabase.use { db ->
-            db.query(
-                "transactions",
-                null,
-                "captured_at BETWEEN ? AND ?",
-                arrayOf(startMillis.toString(), endMillis.toString()),
-                null,
-                null,
-                "captured_at DESC"
-            ).use { cursor -> cursor.readTransactions() }
-        }
+        db.readableDatabase.query(
+            "transactions", null,
+            "captured_at BETWEEN ? AND ?",
+            arrayOf(startMillis.toString(), endMillis.toString()),
+            null, null, "captured_at DESC"
+        ).use { cursor -> cursor.readTransactions() }
 
     @Synchronized
     fun summary(startMillis: Long, endMillis: Long): LedgerSummary {
@@ -152,48 +137,40 @@ class TransactionRepository(context: Context) {
 
     @Synchronized
     fun deleteAll() {
-        database.writableDatabase.use { db ->
-            db.delete("parse_logs", null, null)
-            db.delete("transactions", null, null)
-        }
+        val wdb = db.writableDatabase
+        wdb.delete("parse_logs", null, null)
+        wdb.delete("transactions", null, null)
     }
 
     @Synchronized
     fun categoryHistoryForMerchant(merchant: String?): String? {
         if (merchant.isNullOrBlank()) return null
-        database.readableDatabase.use { db ->
-            db.rawQuery(
-                """
-                SELECT category, COUNT(*) AS cnt
-                FROM transactions
-                WHERE merchant_name = ? AND category IS NOT NULL
-                GROUP BY category
-                ORDER BY cnt DESC
-                LIMIT 1
-                """.trimIndent(),
-                arrayOf(merchant)
-            ).use { cursor ->
-                return if (cursor.moveToFirst()) cursor.getString(0) else null
-            }
+        return db.readableDatabase.rawQuery(
+            """
+            SELECT category, COUNT(*) AS cnt
+            FROM transactions
+            WHERE merchant_name = ? AND category IS NOT NULL
+            GROUP BY category
+            ORDER BY cnt DESC
+            LIMIT 1
+            """.trimIndent(),
+            arrayOf(merchant)
+        ).use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(0) else null
         }
     }
 
-    private fun findIdByFingerprint(db: SQLiteDatabase, fingerprint: String): Long? =
-        db.query(
-            "transactions",
-            arrayOf("id"),
-            "fingerprint = ?",
-            arrayOf(fingerprint),
-            null,
-            null,
-            null,
-            "1"
+    private fun findIdByFingerprint(wdb: SQLiteDatabase, fingerprint: String): Long? =
+        wdb.query(
+            "transactions", arrayOf("id"),
+            "fingerprint = ?", arrayOf(fingerprint),
+            null, null, null, "1"
         ).use { cursor ->
             if (cursor.moveToFirst()) cursor.getLong(0) else null
         }
 
     private fun insertLog(
-        db: SQLiteDatabase,
+        wdb: SQLiteDatabase,
         sourcePackage: String,
         postedAt: Long,
         status: ParseStatus,
@@ -207,7 +184,7 @@ class TransactionRepository(context: Context) {
             put("reason", reason)
             put("transaction_id", transactionId)
         }
-        db.insert("parse_logs", null, values)
+        wdb.insert("parse_logs", null, values)
     }
 
     private fun Cursor.readTransactions(): List<LedgerTransaction> {
@@ -239,23 +216,16 @@ class TransactionRepository(context: Context) {
     }
 
     private fun Cursor.nullableString(column: String): String? {
-        val index = getColumnIndexOrThrow(column)
-        return if (isNull(index)) null else getString(index)
+        val index = getColumnIndexOrThrow(column); return if (isNull(index)) null else getString(index)
     }
-
     private fun Cursor.nullableLong(column: String): Long? {
-        val index = getColumnIndexOrThrow(column)
-        return if (isNull(index)) null else getLong(index)
+        val index = getColumnIndexOrThrow(column); return if (isNull(index)) null else getLong(index)
     }
-
     private fun Cursor.nullableDouble(column: String): Double? {
-        val index = getColumnIndexOrThrow(column)
-        return if (isNull(index)) null else getDouble(index)
+        val index = getColumnIndexOrThrow(column); return if (isNull(index)) null else getDouble(index)
     }
-
     private fun Cursor.nullableFloat(column: String): Float? {
-        val index = getColumnIndexOrThrow(column)
-        return if (isNull(index)) null else getFloat(index)
+        val index = getColumnIndexOrThrow(column); return if (isNull(index)) null else getFloat(index)
     }
 }
 
